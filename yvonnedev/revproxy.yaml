@@ -1,0 +1,243 @@
+---
+apiVersion: v1
+data:
+  nginx.conf: "user  nginx;\nworker_processes  1;\n\nerror_log  /var/log/nginx/error.log
+    warn;\npid        /var/run/nginx.pid;\n\nload_module modules/ngx_http_perl_module.so;\nload_module
+    modules/ngx_http_js_module.so;\nload_module modules/ngx_http_headers_more_filter_module.so;\n\nevents
+    {\n    worker_connections  1024;\n}\n\nhttp {\n    include       /etc/nginx/mime.types;\n
+    \   default_type  application/octet-stream;\n\n    log_format  main  '$remote_addr
+    - $remote_user [$time_local] \"$request\" '\n                      '$status $body_bytes_sent
+    \"$http_referer\" '\n                      '\"$http_user_agent\" \"$http_x_forwarded_for\"';\n\n
+    \   access_log  /var/log/nginx/access.log  main;\n\n    sendfile        on;\n
+    \   #tcp_nopush     on;\n\n    keepalive_timeout  65;\n\n    # Server for Prometheus
+    metrics about nginx\n    server {\n        listen       6567;\n\n        root
+    /var/www/metrics;\n\n        location /aggregated_metrics {\n            types
+    {}\n            default_type text/plain;\n            try_files $uri $uri/ /metrics.txt;\n
+    \           autoindex on;\n            access_log off;\n        }\n    }\n\n    #
+    Server for actual reverse proxy work\n    server {\n        listen       80;\n
+    \       server_name  revproxy-service;\n        resolver 127.0.0.11;\n\n        #
+    listen 443 ssl;\n\n        # ssl_certificate /etc/nginx/ssl/nginx.crt;\n        #
+    ssl_certificate_key /etc/nginx/ssl/nginx.key;\n\n        set $access_token \"\";\n
+    \       set $csrf_check \"ok-tokenauth\";\n        if ($cookie_access_token) {\n
+    \               set $access_token \"bearer $cookie_access_token\";\n                #
+    cookie auth requires csrf check\n                set $csrf_check \"fail\";\n        }\n
+    \       if ($http_authorization) {\n                # Authorization header is
+    present - prefer that token over cookie token\n                set $access_token
+    \"$http_authorization\";\n        }\n\n        proxy_set_header   Authorization
+    \"$access_token\";\n        # proxy_set_header   X-Forwarded-For \"$realip\";\n
+    \       # proxy_set_header   X-UserId \"$userid\";\n\n        #\n        # Accomodate
+    large jwt token headers\n        # * http://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_buffer_size\n
+    \       # * https://ma.ttias.be/nginx-proxy-upstream-sent-big-header-reading-response-header-upstream/\n
+    \       #\n        proxy_buffer_size          16k;\n        proxy_buffers              8
+    16k;\n        proxy_busy_buffers_size    32k;\n        #\n        # also incoming
+    from client:\n        # * https://fullvalence.com/2016/07/05/cookie-size-in-nginx/\n
+    \       # * https://nginx.org/en/docs/http/ngx_http_core_module.html#client_header_buffer_size\n
+    \       large_client_header_buffers 4 8k;\n        client_header_buffer_size 4k;\n\n
+    \       #\n        # CSRF check\n        # This block requires a csrftoken for
+    all POST requests.\n        #\n        if ($cookie_csrftoken = $http_x_csrf_token)
+    {\n          # this will fail further below if cookie_csrftoken is empty\n          set
+    $csrf_check \"ok-$cookie_csrftoken\";\n        }\n        if ($request_method
+    != \"POST\") {\n          set $csrf_check \"ok-$request_method\";\n        }\n
+    \       if ($cookie_access_token = \"\") {\n          # do this again here b/c
+    empty cookie_csrftoken == empty http_x_csrf_token - ugh  \n          set $csrf_check
+    \"ok-tokenauth\";\n        }\n\n        # Needed for prometheus metrics\n        location
+    = /nginx_status {\n            stub_status;\n            allow 127.0.0.1;\n            deny
+    all;\n            access_log off;\n        }\n        location / {\n                proxy_pass
+    http://portal-service.default.svc.cluster.local/;\n        }\n        location
+    /user/ {\n                proxy_pass http://fence-service.default.svc.cluster.local/;\n
+    \       }\n        location /api/ {\n                proxy_pass http://sheepdog-service.default.svc.cluster.local/;\n
+    \       }\n        location /coremetadata/ {\n            # redirect to coremetadata
+    landing page if header does not specify otherwise\n            if ($http_accept
+    !~ (application/json|x-bibtex|application/vnd\\.schemaorg\\.ld\\+json)) {\n              rewrite
+    ^/coremetadata/(.*) /files/$1 redirect;\n            }\n\n            rewrite
+    ^/coremetadata/(.*) /$1 break;\n            proxy_pass http://pidgin-service.default.svc.cluster.local/;\n
+    \       }\n\n        location /pidgin/_status {\n            proxy_pass http://pidgin-service.default.svc.cluster.local/_status;\n
+    \       }\n        location /index/ {\n                proxy_pass http://indexd-service.default.svc.cluster.local/;\n
+    \       }\n\n        location = /_status {    \n            default_type application/json;\n
+    \           return 200 \"{ \\\"message\\\": \\\"Fealin good!\\\" }\\n\";\n        }\n
+    \       location /peregrine/_status {\n            proxy_pass http://peregrine-service.default.svc.cluster.local/_status;\n
+    \       }\n\n        location /api/v0/submission/getschema {\n            proxy_pass
+    http://peregrine-service.default.svc.cluster.local/v0/submission/getschema;\n
+    \       }\n\n        location /api/v0/submission/graphql {\n                if
+    ($cookie_csrftoken = \"\") {\n                        add_header Set-Cookie \"csrftoken=$request_id$request_length$request_time$time_iso8601;Path=/\";\n
+    \               }\n                proxy_next_upstream off;\n                #
+    Forward the host and set Subdir header so api\n                # knows the original
+    request path for hmac signing\n                proxy_set_header   Host $host;\n
+    \               proxy_set_header   Subdir /api;\n                proxy_set_header
+    \  Authorization \"$access_token\";\n                proxy_connect_timeout 300;\n
+    \               proxy_send_timeout 300;\n                proxy_read_timeout 300;\n
+    \               send_timeout 300;\n                proxy_pass http://peregrine-service.default.svc.cluster.local/v0/submission/graphql;\n
+    \       }\n\n        location /api/search {\n            if ($csrf_check !~ ^ok-\\S.+$)
+    {\n              return 403 \"failed csrf check\";\n            }\n\n            gzip
+    off;\n            proxy_next_upstream off;\n            proxy_set_header   Host
+    $host;\n            proxy_set_header   Authorization \"$access_token\";\n            \n
+    \           proxy_connect_timeout 300;\n            proxy_send_timeout 300;\n
+    \           proxy_read_timeout 300;\n            send_timeout 300;\n\n            rewrite
+    ^/api/search/(.*) /$1 break;\n            proxy_pass http://peregrine-service.default.svc.cluster.local;\n
+    \       }\n        location /guppy/ {\n                proxy_pass http://guppy-service.default.svc.cluster.local/;\n
+    \       }\n        location @errorworkspace {\n            return 302 https://$host/no-workspace-access;\n
+    \       }\n        \n        location = /authz/health {\n            if ($csrf_check
+    !~ ^ok-\\S.+$) {\n                return 403 \"failed csrf check\";\n            }\n\n
+    \           proxy_pass http://arborist-service.default.svc.cluster.local/health;
+    \               \n        }\n\n        #\n        # authorization endpoint\n        #
+    https://hostname/authz?resource=programs/blah&method=acb&service=xyz\n        #\n
+    \       location ~ /authz/? {\n            if ($csrf_check !~ ^ok-\\S.+$) {\n
+    \               return 403 \"failed csrf check\";\n            }\n            set
+    $proxy_service  \"arborist\";\n\n            proxy_pass http://arborist-service.default.svc.cluster.local/auth/proxy?resource=$arg_resource&method=$arg_method&service=$arg_service;\n
+    \       }\n\n        location = /authz/resources {\n            if ($csrf_check
+    !~ ^ok-\\S.+$) {\n                return 403 \"failed csrf check\";\n            }\n\n
+    \           proxy_pass http://arborist-service.default.svc.cluster.local/auth/resources;\n
+    \       }\n\n        location = /authz/mapping {\n            if ($csrf_check
+    !~ ^ok-\\S.+$) {\n                return 403 \"failed csrf check\";\n            }\n\n
+    \           # Do not expose POST /auth/mapping\n            limit_except GET {\n
+    \               deny all;\n            }\n\n            # Do not pass the username
+    arg here! Otherwise anyone can see anyone's access.\n            # Arborist will
+    fall back to parsing the jwt for username.\n            proxy_pass http://arborist-service.default.svc.cluster.local/auth/mapping;\n
+    \       }\n\n    }\n}"
+kind: ConfigMap
+metadata:
+  labels:
+    app: revproxy
+  name: revproxy-nginx-conf
+  namespace: default
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-resource-group: rg-gen3-dev
+  labels:
+    app: revproxy
+  name: revproxy-service
+  namespace: default
+spec:
+  loadBalancerIP: 52.156.151.174
+  ports:
+  - name: 80-80
+    port: 80
+    protocol: TCP
+  selector:
+    app: revproxy
+    release: development
+  type: LoadBalancer
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    gen3.io/network-ingress: portal,sowerjob
+  labels:
+    app: revproxy
+    release: development
+  name: revproxy-deployment
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: revproxy
+  template:
+    metadata:
+      annotations:
+        prometheus.io/path: /aggregated_metrics
+        prometheus.io/port: "6567"
+        prometheus.io/scrape: "true"
+      labels:
+        app: revproxy
+        release: development
+    spec:
+      containers:
+      - args:
+        - -c
+        - |2
+
+          # gen3 cli swaps out the image from cloud-automation with one that contains logrotate
+          # TODO decide whether to pull the source code for nginx to build a custom image with lograte pre-installed
+          apt update
+          apt install -y logrotate
+
+          which logrotate
+          RC=$?
+          if [ $RC != 0 ]; then
+            echo "logrotate is not installed. Do not collect metrics..."
+          else
+            mkdir -p /var/www/metrics/
+            (
+              while true; do
+                logrotate --force /etc/logrotate.d/logrotate-nginx.conf
+                sleep 86400
+                done
+            ) &
+            (
+              while true; do
+                curl -s http://127.0.0.1:9113/metrics >> /var/www/metrics/metrics.txt
+                curl -s http://127.0.0.1:4040/metrics >> /var/www/metrics/metrics.txt
+                sleep 10
+              done
+            ) &
+          fi
+          exec nginx -g 'daemon off;'
+        command:
+        - /bin/sh
+        image: quay.io/cdis/nginx:1.17.6-ctds-1.0.1
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          httpGet:
+            path: /_status
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 30
+        name: nginx
+        ports:
+        - containerPort: 80
+        - containerPort: 443
+        - containerPort: 6567
+        readinessProbe:
+          httpGet:
+            path: /_status
+            port: 80
+        volumeMounts:
+        - mountPath: /etc/nginx/nginx.conf
+          name: revproxy-conf
+          readOnly: true
+          subPath: nginx.conf
+        - mountPath: /var/log/nginx/
+          name: logs-folder
+      - args:
+        - -c
+        - "attempt=0\nmaxAttempts=12\nwhile true\ndo\n  nginx_status_response=$(curl
+          -L -s -o /dev/null -w \"%{http_code}\" -X GET http://localhost/nginx_status)\n
+          \ echo \"initializing nginx-prometheus-exporter...\"\n  echo \"nginx_status_response:
+          $nginx_status_response\"\n  \n  if [ \"$nginx_status_response\" == 200 ];
+          then\n    echo \"nginx_status is finally up and running. Proceed with the
+          metrics exporting...\"\n    /usr/bin/exporter -nginx.scrape-uri http://127.0.0.1/nginx_status\n
+          \ else\n    echo \"The nginx_status endpoint is not ready yet... attempt
+          #${attempt}\"\n    sleep 5\n    if [ $attempt -eq $maxAttempts ];then\n
+          \     echo \"The nginx_status endpoint was never initialized properly, keep
+          the sidecar running in sleep mode to prevent the entire pod from failing...\"\n
+          \     sleep infinity\n    fi\n  fi\n  attempt=$(( $attempt + 1 ));\ndone\n"
+        command:
+        - /bin/bash
+        image: quay.io/cdis/nginx-prometheus-exporter-wrapper:pybase3-1.4.2
+        imagePullPolicy: IfNotPresent
+        name: nginx-prometheus-exporter
+        ports:
+        - containerPort: 9113
+      - args:
+        - /mnt/nginxlogs/access_not_json.log
+        image: quay.io/martinhelmich/prometheus-nginxlog-exporter:v1.8.0
+        name: nginx-logs-exporter
+        ports:
+        - containerPort: 4040
+        volumeMounts:
+        - mountPath: /mnt/nginxlogs/
+          name: logs-folder
+      volumes:
+      - configMap:
+          name: revproxy-nginx-conf
+        name: revproxy-conf
+      - emptyDir: {}
+        name: logs-folder
+

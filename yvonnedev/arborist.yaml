@@ -1,0 +1,265 @@
+---
+---
+# Source: arborist/templates/svc-arborist.yaml
+kind: Service
+apiVersion: v1
+metadata:
+  name: arborist-service
+spec:
+  selector:
+    app: arborist
+    release: development
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+      name: http
+      nodePort: null
+    - protocol: TCP
+      port: 443
+      targetPort: 443
+      name: https
+      nodePort: null
+  type: ClusterIP
+---
+
+# Source: arborist/templates/dpl-arborist.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arborist-deployment
+spec:
+  selector:
+    matchLabels:
+      app: arborist
+      release: development
+  revisionHistoryLimit: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: arborist
+        release: development
+        # for network policy selectors
+        authprovider: "yes"
+        dbarborist: "yes"
+        # for revproxy authz
+        public: "yes"
+        #GEN3_DATE_LABEL
+        aadpodidbinding: azure-pod-identity-binding-selector
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - arborist
+              topologyKey: "kubernetes.io/hostname"
+      automountServiceAccountToken: false
+      volumes:
+        - name: secrets-store-volume
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: arborist-azure-kvname
+      containers:
+      - name: arborist
+        image: "quay.io/cdis/arborist:2020.09"
+        imagePullPolicy: Always
+        env:
+          - name: JWKS_ENDPOINT
+            value: "http://fence-service/.well-known/jwks"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 60
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 60
+          timeoutSeconds: 10
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: secrets-store-volume
+          mountPath: "/mnt/secrets-store"
+          readOnly: true
+        resources:
+          requests:
+            cpu: 0.4
+            memory: 1200Mi
+          limits:
+            cpu: 0.8
+            memory: 2400Mi
+        command: ["/bin/bash"]
+        args:
+          - "-c"
+          - |
+            # Copy secret-store file
+            mkdir -p /var/www/arborist/
+            cp /mnt/secrets-store/arborist-creds /var/www/arborist/dbcreds.json
+            # set env vars
+            export PGDATABASE=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_database')
+            export PGUSER=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_username')
+            export PGPASSWORD=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_password')
+            export PGHOST=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_host')
+            export PGPORT="5432"
+            export PGSSLMODE="require"
+            
+            # bring the database schema up to the latest version
+            /go/src/github.com/uc-cdis/arborist/migrations/latest
+
+            # run arborist
+            /go/src/github.com/uc-cdis/arborist/bin/arborist
+---
+
+# Source: arborist/templates/job-arborist-create.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: arboristdb-create
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gen3job
+        aadpodidbinding: azure-pod-identity-binding-selector
+    spec:
+      automountServiceAccountToken: false
+      volumes:
+        - name: secrets-store-volume
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: arborist-azure-kvname
+      containers:
+      - name: arborist
+        image: "quay.io/cdis/arborist:2020.09"
+        imagePullPolicy: Always
+        env:
+          - name: PYTHONPATH
+            value: /var/www/arborist
+        volumeMounts:
+        - name: secrets-store-volume
+          mountPath: "/mnt/secrets-store"
+          readOnly: true
+        command: ["sh"]
+        args:
+          - "-c"        
+          - |
+            # Copy secret-store file
+            mkdir -p /var/www/arborist/
+            cp /mnt/secrets-store/arborist-creds /var/www/arborist/dbcreds.json
+            # set env vars
+            export PGDATABASE=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_database')
+            export PGUSER=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_username')
+            export PGPASSWORD=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_password')
+            export PGHOST=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_host')
+            export PGPORT="5432"
+            export PGSSLMODE="require"
+            
+
+            # bring the database schema up to the latest version
+            /go/src/github.com/uc-cdis/arborist/migrations/latest
+
+            echo "Exit code: $?"          
+      restartPolicy: Never
+---
+
+# Source: arborist/templates/cron-arborist-rm-expired-access.yaml
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: arborist-rm-expired-access
+spec:
+  schedule: "@hourly"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: gen3job
+            aadpodidbinding: azure-pod-identity-binding-selector
+        spec:
+          volumes:
+            - name: secrets-store-volume
+              csi:
+                driver: secrets-store.csi.k8s.io
+                readOnly: true
+                volumeAttributes:
+                  secretProviderClass: arborist-azure-kvname
+          automountServiceAccountToken: false
+          containers:
+          - name: arborist
+            image: "quay.io/cdis/arborist:2020.09"
+            imagePullPolicy: Always
+            volumeMounts:
+            - name: secrets-store-volume
+              mountPath: "/mnt/secrets-store"
+              readOnly: true
+            command: ["sh"]
+            args:
+            - "-c"
+            - |
+                # Copy secret-store file
+                mkdir -p /var/www/arborist/
+                cp /mnt/secrets-store/arborist-creds /var/www/arborist/dbcreds.json
+                # set env vars
+                export PGDATABASE=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_database')
+                export PGUSER=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_username')
+                export PGPASSWORD=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_password')
+                export PGHOST=$(cat /var/www/arborist/dbcreds.json | jq -r '.db_host')
+                export PGPORT="5432"
+                export PGSSLMODE="require"
+                
+                # run job to remove expired access from the database
+                /go/src/github.com/uc-cdis/arborist/jobs/delete_expired_access
+          restartPolicy: Never
+          dnsConfig:
+            options:
+            - name: use-vc
+            - name: single-request-reopen
+          dnsPolicy: ClusterFirst
+---
+
+# Source: arborist/templates/spc-arborist.yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1alpha1
+kind: SecretProviderClass
+metadata:
+  name: arborist-azure-kvname
+spec:
+  provider: "azure" # Only supporting Azure right now
+  parameters:
+    usePodIdentity: 'true'
+    keyvaultName: gen3-dev-ceok-kv
+    cloudName: 'AzurePublicCloud'
+    objects:  |
+      array:
+        - |
+          objectName: arborist-creds
+          objectType: secret
+          objectVersion: 
+    resourceGroup: rg-gen3-dev 
+    subscriptionId: b59451c1-cd43-41b3-b3a4-74155d8f6cf6 
+    tenantId: 72f988bf-86f1-41af-91ab-2d7cd011db47
+

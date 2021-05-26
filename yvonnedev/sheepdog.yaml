@@ -1,0 +1,316 @@
+---
+---
+# Source: sheepdog/templates/cm-sheepdog-settings.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sheepdog-settings
+data:
+  wsgi.py: |-
+    
+    #####################################################
+    # DO NOT CHANGE THIS FILE                           #
+    # config updates should be done in the service code #
+    #####################################################
+    
+    from sheepdog.api import app, app_init
+    from os import environ
+    import config_helper
+    
+    APP_NAME='sheepdog'
+    def load_json(file_name):
+      return config_helper.load_json(file_name, APP_NAME)
+    
+    conf_data = load_json('creds.json')
+    config = app.config
+    
+    config["AUTH"] = 'https://auth.service.consul:5000/v3/'
+    config["AUTH_ADMIN_CREDS"] = None
+    config["INTERNAL_AUTH"] = None
+    
+    # ARBORIST deprecated, replaced by ARBORIST_URL
+    # ARBORIST_URL is initialized in app_init() directly
+    config["ARBORIST"] = "http://arborist-service/"
+    
+    # Signpost: deprecated, replaced by index client.
+    config['SIGNPOST'] = {
+        'host': environ.get('SIGNPOST_HOST') or 'http://indexd-service',
+        'version': 'v0',
+        'auth': ('gdcapi', conf_data.get('indexd_password', '{{indexd_password}}')),
+    }
+    config['INDEX_CLIENT'] = {
+        'host': environ.get('INDEX_CLIENT_HOST') or 'http://indexd-service',
+        'version': 'v0',
+        'auth': ('gdcapi', conf_data.get('indexd_password', '{{indexd_password}}')),
+    }
+    config["FAKE_AUTH"] = False
+    config["PSQLGRAPH"] = {
+        'host': conf_data['db_host'],
+        'user': conf_data['db_username'],
+        'password': conf_data['db_password'],
+        'database': conf_data['db_database'],
+    }
+    
+    config['HMAC_ENCRYPTION_KEY'] = conf_data.get('hmac_key', '{{hmac_key}}')
+    config['FLASK_SECRET_KEY'] = conf_data.get('gdcapi_secret_key', '{{gdcapi_secret_key}}')
+    config['PSQL_USER_DB_CONNECTION'] = 'postgresql://%s:%s@%s:5432/%s' % tuple([ conf_data.get(key, key) for key in ['fence_username', 'fence_password', 'fence_host', 'fence_database']])
+    config['OIDC_ISSUER'] = 'https://%s/user' % conf_data['hostname']
+    
+    config['OAUTH2'] = {
+        'client_id': conf_data.get('oauth2_client_id', '{{oauth2_client_id}}'),
+        'client_secret': conf_data.get('oauth2_client_secret', '{{oauth2_client_secret}}'),
+        'api_base_url': 'https://%s/user/' % conf_data['hostname'],
+        'authorize_url': 'https://%s/user/oauth2/authorize' % conf_data['hostname'],
+        'access_token_url': 'https://%s/user/oauth2/token' % conf_data['hostname'],
+        'refresh_token_url': 'https://%s/user/oauth2/token' % conf_data['hostname'],
+        'client_kwargs': {
+            'redirect_uri': 'https://%s/api/v0/oauth2/authorize' % conf_data['hostname'],
+            'scope': 'openid data user',
+        },
+        # deprecated key values, should be removed after all commons use new oidc
+        'internal_oauth_provider': 'http://fence-service/oauth2/',
+        'oauth_provider': 'https://%s/user/oauth2/' % conf_data['hostname'],
+        'redirect_uri': 'https://%s/api/v0/oauth2/authorize'  % conf_data['hostname']
+    }
+    config['USER_API'] = environ.get('FENCE_URL') or 'http://fence-service/'
+    # use the USER_API URL instead of the public issuer URL to accquire JWT keys
+    config['FORCE_ISSUER'] = True
+    config['DICTIONARY_URL'] = environ.get('DICTIONARY_URL','https://s3.amazonaws.com/dictionary-artifacts/datadictionary/develop/schema.json')
+    
+    app_init(app)
+    application = app
+    application.debug = (environ.get('GEN3_DEBUG') == "True")
+---
+
+# Source: sheepdog/templates/svc-sheepdog.yaml
+kind: Service
+apiVersion: v1
+metadata:
+  name: sheepdog-service
+spec:
+  selector:
+    app: sheepdog
+    release: development
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+      name: http
+      nodePort: null
+    - protocol: TCP
+      port: 443
+      targetPort: 443
+      name: https
+      nodePort: null
+  type: ClusterIP
+---
+
+# Source: sheepdog/templates/dpl-sheepdog.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sheepdog-deployment
+spec:
+  selector:
+    # Only select pods based on the 'app' label
+    matchLabels:
+      app: sheepdog
+      release: development
+  revisionHistoryLimit: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: sheepdog
+        release: development
+        public: "yes"
+        # to download dictionary
+        s3: "yes"
+        #GEN3_DATE_LABEL
+        aadpodidbinding: azure-pod-identity-binding-selector
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - sheepdog
+              topologyKey: "kubernetes.io/hostname"
+      automountServiceAccountToken: false
+      volumes:
+        - name: config-helper
+          configMap:
+            name: config-helper
+        - name: secrets-store-volume
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: sheepdog-azure-kvname
+        - name: config-volume
+          configMap:
+            name: sheepdog-settings
+      # sheepdog transactions take forever -
+      # try to let the complete before termination
+      terminationGracePeriodSeconds: 50
+      containers:
+        - name: sheepdog
+          image: "quay.io/cdis/sheepdog:2020.09"
+          livenessProbe:
+            httpGet:
+              path: /_status?timeout=20
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /_status?timeout=2
+              port: 80
+          ports:
+          - containerPort: 80
+          - containerPort: 443
+          env:
+          - name: DICTIONARY_URL
+            value: https://rushdatadictionary.blob.core.windows.net/$web/datadictionary/andy-dd-test/schema.json
+          - name: ARBORIST_URL
+            value: http://arborist-service
+          - name: INDEX_CLIENT_HOST
+            value: http://indexd-service
+          - name: AUTH_NAMESPACE
+            valueFrom:
+              configMapKeyRef:
+                name: manifest-global
+                key: auth_namespace
+                optional: true
+          - name: GEN3_DEBUG_FLAG
+            value: "False"
+          volumeMounts:
+            - name: "config-helper"
+              readOnly: true
+              mountPath: "/var/www/sheepdog/config_helper.py"
+              subPath: config_helper.py
+            - name: secrets-store-volume
+              mountPath: "/mnt/secrets-store"
+              readOnly: true
+            - name: config-volume
+              readOnly: true
+              mountPath: "/var/www/sheepdog/wsgi.py"
+              subPath: "wsgi.py"
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: 0.8
+              memory: 1024Mi
+            limits:
+              cpu: 2
+              memory: 2048Mi
+          command: ["/bin/bash"]
+          args:
+            - "-c"
+            - |
+              echo "Copy sheepdog-creds from secret store mount"
+              cp /mnt/secrets-store/sheepdog-creds /var/www/sheepdog/creds.json
+
+              echo "***TODO***"
+              echo "Copy from SS to docker image: wsgi.py, ca.pem --> cdis-ca.crt, service.key, service.crt"
+              echo "Figure out REQUESTS_CA_BUNDLE"
+              echo "Then run 'update-ca-certificates'"
+              bash /dockerrun.sh
+---
+
+# Source: sheepdog/templates/job-gdcdb-create.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gdcdb-create
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gen3job
+        aadpodidbinding: azure-pod-identity-binding-selector
+    spec:
+      automountServiceAccountToken: false
+      volumes:
+        - name: secrets-store-volume
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: sheepdog-azure-kvname
+      containers:
+        - name: sheepdog
+          image: "quay.io/cdis/sheepdog:2020.09"
+          env:
+          - name: DICTIONARY_URL
+            value: https://rushdatadictionary.blob.core.windows.net/$web/datadictionary/andy-dd-test/schema.json
+          volumeMounts:
+            - name: secrets-store-volume
+              mountPath: "/mnt/secrets-store"
+              readOnly: true
+          imagePullPolicy: Always
+          command: ["/bin/bash" ]
+          args: 
+            - "-c"
+            # Script always succeeds if it runs (echo exits with 0)  
+            - |
+              # Copy secret-store file
+              mkdir -p /var/www/sheepdog/
+              cp /mnt/secrets-store/sheepdog-creds /var/www/sheepdog/creds.json
+              eval $(python 2> /dev/null <<EOM
+              import json
+              creds = json.load(open('/var/www/sheepdog/creds.json', 'r'))
+              print('declare -A db_creds')
+              for key in ['db_host', 'db_username', 'db_password', 'db_database']:
+                print("db_creds['%s']='%s'" % (key, creds[key]))
+              EOM
+              )
+              #
+              # sheepdog sets up core data model now,
+              # but suffers from a race condition doing it ...
+              #
+              echo datamodel_postgres_admin create-all -U "${db_creds[db_username]}" -P XXXXXXX -H "${db_creds[db_host]}" -D "${db_creds[db_database]}"
+              datamodel_postgres_admin create-all -U "${db_creds[db_username]}" -P "${db_creds[db_password]}" -H "${db_creds[db_host]}" -D "${db_creds[db_database]}"
+              
+              echo python /sheepdog/bin/setup_transactionlogs.py --user "${db_creds[db_username]}"  --password XXXXX --host "${db_creds[db_host]}" --database "${db_creds[db_database]}"
+              python /sheepdog/bin/setup_transactionlogs.py --user "${db_creds[db_username]}"  --password "${db_creds[db_password]}" --host "${db_creds[db_host]}" --database "${db_creds[db_database]}"
+              echo "Exit code: $?"
+      restartPolicy: Never
+---
+
+# Source: sheepdog/templates/spc-sheepdog.yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1alpha1
+kind: SecretProviderClass
+metadata:
+  name: sheepdog-azure-kvname
+spec:
+  provider: "azure" # Only supporting Azure right now
+  parameters:
+    usePodIdentity: 'true'
+    keyvaultName: gen3-abrig-sakw-kv
+    cloudName: 'AzurePublicCloud'
+    objects:  |
+      array:
+        - |
+          objectName: gen3-service-ca
+          objectType: cert
+          objectVersion: 
+        - |
+          objectName: sheepdog-creds
+          objectType: secret
+          objectVersion: 
+    resourceGroup: rg-gen3-abrig-env 
+    subscriptionId: b59451c1-cd43-41b3-b3a4-74155d8f6cf6 
+    tenantId: 72f988bf-86f1-41af-91ab-2d7cd011db47
+

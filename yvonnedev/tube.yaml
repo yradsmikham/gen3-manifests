@@ -1,0 +1,333 @@
+---
+---
+# Source: tube/templates/cm-etl-mapping.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: "etl-mapping"
+data:
+  etlMapping.yaml: |-
+    
+    mappings:
+      - name: etl
+        doc_type: case
+        type: aggregator
+        root: case
+        props:
+          - name: submitter_id
+          - name: project_id
+          - name: disease_type
+          - name: primary_site
+        flatten_props:
+          - path: demographics
+            props:
+              - name: gender
+                value_mappings:
+                  - female: F
+                  - male: M
+              - name: race
+                value_mappings:
+                  - american indian or alaskan native: Indian
+              - name: ethnicity
+              - name: year_of_birth
+        aggregated_props:
+          - name: _samples_count
+            path: samples
+            fn: count
+          - name: _aliquots_count
+            path: samples.aliquots
+            fn: count
+          - name: _submitted_methylations_count
+            path: samples.aliquots.submitted_methylation_files
+            fn: count
+          - name: _submitted_copy_number_files_on_aliquots_count
+            path: samples.aliquots.submitted_copy_number_files
+            fn: count
+          - name: _read_groups_count
+            path: samples.aliquots.read_groups
+            fn: count
+          - name: _submitted_aligned_reads_count
+            path: samples.aliquots.read_groups.submitted_aligned_reads_files
+            fn: count
+          - name: _submitted_unaligned_reads_count
+            path: samples.aliquots.read_groups.submitted_unaligned_reads_files
+            fn: count
+          - name: _submitted_copy_number_files_on_read_groups_count
+            path: samples.aliquots.read_groups.submitted_copy_number_files
+            fn: count
+          - name: _submitted_somatic_mutations_count
+            path: samples.aliquots.read_groups.submitted_somatic_mutations
+            fn: count
+        joining_props:
+          - index: file
+            join_on: case_id
+            props:
+              - name: data_format
+                src: data_format
+                fn: set
+              - name: data_type
+                src: data_type
+                fn: set
+              - name: file_id
+                src: file_id
+                fn: set
+      - name: file
+        doc_type: file
+        type: collector
+        root: None
+        category: data_file
+        props:
+          - name: object_id
+          - name: md5sum
+          - name: file_name
+          - name: file_size
+          - name: data_format
+          - name: data_type
+          - name: state
+        injecting_props:
+          case:
+            props:
+              - name: case_id
+                src: id
+                fn: set
+              - name: project_id
+        target_nodes:
+          - name: slide_image
+            path: slides.samples.cases
+---
+
+# Source: tube/templates/cm-tube-settings.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: "tube-settings"
+data:
+  tube_settings.py: |-
+    
+    from cdislogging import get_logger
+    from tube.config_helper import *
+    
+    # import config_helper
+    import os
+    from .utils.general import get_resource_paths_from_yaml
+    
+    
+    logger = get_logger("__name__", log_level="warn")
+    
+    LIST_TABLES_FILES = "tables.txt"
+    
+    #
+    # Load db credentials from a creds.json file.
+    # See config_helper.py for paths searched for creds.json
+    # ex: export XDG_DATA_HOME="$HOME/.local/share"
+    #    and setup $XDG_DATA_HOME/.local/share/gen3/tube/creds.json
+    #
+    conf_data = load_json("creds.json", "tube")
+    DB_HOST = conf_data.get("db_host", "my-psql-server-123.postgres.database.azure.com")
+    DB_PORT = conf_data.get("db_port", "5432")
+    DB_DATABASE = conf_data.get("db_database", "gdcdb")
+    DB_USERNAME = conf_data.get("db_username", "peregrine_user@my-psql-server-123")
+    DB_PASSWORD = conf_data.get("db_password", "my-password")
+    DB_USE_SSL = conf_data.get("db_use_ssl", False)  # optional property to db_use_ssl
+    JDBC = (
+        "jdbc:postgresql://{}:{}/{}".format(DB_HOST, DB_PORT, DB_DATABASE)
+        if DB_USE_SSL is False
+        else "jdbc:postgresql://{}:{}/{}?sslmode=require".format(
+            DB_HOST, DB_PORT, DB_DATABASE
+        )
+    )
+    PYDBC = "postgresql://{}:{}@{}:{}/{}".format(
+        DB_USERNAME, DB_PASSWORD, DB_HOST, DB_PORT, DB_DATABASE
+    )
+    DICTIONARY_URL = os.getenv(
+        "DICTIONARY_URL",
+        "https://s3.amazonaws.com/dictionary-artifacts/datadictionary/develop/schema.json",
+    )
+    ES_URL = os.getenv("ES_URL", "esproxy-service")
+    
+    HDFS_DIR = "/result"
+    # Three modes: Test, Dev, Prod
+    RUNNING_MODE = os.getenv("RUNNING_MODE", "Dev")  # 'Prod' or 'Dev'
+    
+    PARALLEL_JOBS = 1
+    
+    ES = {
+        "es.nodes": ES_URL,
+        "es.port": "9200",
+        "es.input.json": "yes",
+        "es.nodes.client.only": "false",
+        "es.nodes.discovery": "false",
+        "es.nodes.data.only": "false",
+        "es.nodes.wan.only": "true",
+    }
+    
+    HADOOP_HOME = os.getenv("HADOOP_HOME", "/usr/local/Cellar/hadoop/3.1.0/libexec/")
+    JAVA_HOME = os.getenv(
+        "JAVA_HOME", "/Library/Java/JavaVirtualMachines/jdk1.8.0_131.jdk/Contents/Home"
+    )
+    HADOOP_URL = os.getenv("HADOOP_URL", "http://spark-service:9000")
+    ES_HADOOP_VERSION = os.getenv("ES_HADOOP_VERSION", "")
+    ES_HADOOP_HOME_BIN = "{}/elasticsearch-hadoop-{}".format(
+        os.getenv("ES_HADOOP_HOME", ""), os.getenv("ES_HADOOP_VERSION", "")
+    )
+    HADOOP_HOST = os.getenv("HADOOP_HOST", "spark-service")
+    # Searches same folders as load_json above
+    
+    MAPPING_FILE = find_paths("etlMapping.yaml", "tube")[0]
+    try:
+        USERYAML_FILE = find_paths("user.yaml", "tube")[0]
+    except IndexError:
+        USERYAML_FILE = None
+    PROJECT_TO_RESOURCE_PATH = get_resource_paths_from_yaml(USERYAML_FILE)
+    
+    SPARK_MASTER = os.getenv("SPARK_MASTER", "local[1]")  # 'spark-service'
+    SPARK_EXECUTOR_MEMORY = os.getenv("SPARK_EXECUTOR_MEMORY", "2g")
+    SPARK_DRIVER_MEMORY = os.getenv("SPARK_DRIVER_MEMORY", "512m")
+    APP_NAME = "Gen3 ETL"
+    
+    os.environ[
+        "PYSPARK_SUBMIT_ARGS"
+    ] = "--jars {}/dist/elasticsearch-spark-20_2.11-{}.jar pyspark-shell".format(
+        ES_HADOOP_HOME_BIN, ES_HADOOP_VERSION
+    )
+    os.environ["HADOOP_CLIENT_OPTS"] = os.getenv("HADOOP_CLIENT_OPTS", "")
+---
+
+# Source: tube/templates/cron-etl.yaml
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: etl
+spec:
+  schedule: "@daily"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: gen3job
+            aadpodidbinding: azure-pod-identity-binding-selector
+        spec:
+          volumes:
+          - name: secrets-store-volume
+            csi:
+              driver: secrets-store.csi.k8s.io
+              readOnly: true
+              volumeAttributes:
+                secretProviderClass: tube-azure-kvname
+          - name: etl-mapping
+            configMap:
+              name: etl-mapping
+          - name: user-yaml
+            configMap:
+                name: user-yaml
+          - name: tube-settings
+            configMap:
+              name: tube-settings
+              items:
+              - key: tube_settings.py
+                path: local_settings.py
+          restartPolicy: Never
+          containers:
+            - name: tube
+              imagePullPolicy: Always
+              image: "acrvcfe.azurecr.io/tube:azure-postgresql-20210417.18"
+              ports:
+              - containerPort: 80
+              env:
+              - name: DICTIONARY_URL
+                value: https://rushdatadictionary.blob.core.windows.net/$web/datadictionary/andy-dd-test/schema.json
+              - name: HADOOP_URL
+                value: "hdfs://spark-service:9000"
+              - name: ES_URL
+                value: elasticsearch-master.elasticsearch.svc.cluster.local
+              - name: ES_INDEX_NAME
+                value: etl #GEN3_TUBE_ES_INDEX_NAME|-null-|
+              - name: HADOOP_HOST
+                value: spark-service
+              - name: HADOOP_CLIENT_OPTS
+                value: -Xmx1g
+              - name: SPARK_EXECUTOR_MEMORY
+                value: 4g
+              - name: SPARK_DRIVER_MEMORY
+                value: 6g
+              - name: slackWebHook
+                value: None
+              - name: teamsWebHook
+                value: https://microsoft.webhook.office.com/webhookb2/c126f5c7-3e8e-4802-96f2-5e5c70fbe1bd@72f988bf-86f1-41af-91ab-2d7cd011db47/IncomingWebhook/35dd640b28004d2eb7564114f5292307/375bdb15-6046-4af3-9fbc-f1020e458080
+              - name: gen3Env
+                value: development
+              volumeMounts:
+              - name: secrets-store-volume
+                mountPath: "/mnt/secrets-store"
+                readOnly: true
+              - name: "etl-mapping"
+                readOnly: true
+                mountPath: "/gen3/tube/etlMapping.yaml"
+                subPath: "etlMapping.yaml"
+              - name: "user-yaml"
+                mountPath: "/gen3/tube/user.yaml"
+                subPath: user.yaml
+              - name: "tube-settings"
+                readOnly: true
+                mountPath: "/gen3/tube/local_settings.py"
+                subPath: local_settings.py
+              resources:
+                limits:
+                  cpu: 1
+                  memory: 10Gi
+              command: ["/bin/bash"]
+              args:
+                - "-c"
+                - |
+                  # Copy secret-store file
+                  mkdir -p /gen3/tube/
+                  cp /mnt/secrets-store/peregrine-creds /gen3/tube/creds.json
+                  python run_config.py && python run_etl.py
+                  exitcode=$?
+
+                  if [[ "${slackWebHook}" != 'None' ]]; then
+                    if [[ $exitcode == 1 ]]; then
+                      curl -X POST --data-urlencode "payload={\"text\": \"JOBFAIL: ETL job on ${gen3Env}\"}" "${slackWebHook}"
+                    else
+                      curl -X POST --data-urlencode "payload={\"text\": \"SUCCESS: ETL job on ${gen3Env}\"}" "${slackWebHook}"
+                    fi
+                  fi
+
+                  if [ "${teamsWebHook}" != 'None' ]; then
+                    if [ $exitcode == 1 ]; then
+                      curl -H 'Content-Type: application/json' -d "{\"text\": \"JOBFAIL: ETL job on "${gen3Env}"\"}" "${teamsWebHook}"
+                    else
+                      curl -H 'Content-Type: application/json' -d "{\"text\": \"SUCCESS: ETL job on "${gen3Env}"\"}" "${teamsWebHook}"
+                    fi
+                  fi
+
+                  echo "Exit code: $exitcode"
+                  exit "$exitcode"
+---
+
+# Source: tube/templates/spc-tube.yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1alpha1
+kind: SecretProviderClass
+metadata:
+  name: tube-azure-kvname
+spec:
+  provider: "azure" # Only supporting Azure right now
+
+  parameters:
+    usePodIdentity: 'true'
+    keyvaultName: gen3-abrig-sakw-kv
+    cloudName: 'AzurePublicCloud'
+    objects:  |
+      array:
+        - |
+          objectName: peregrine-creds
+          objectType: secret
+          objectVersion: 
+    resourceGroup: rg-gen3-abrig-env
+    subscriptionId: b59451c1-cd43-41b3-b3a4-74155d8f6cf6
+    tenantId: 72f988bf-86f1-41af-91ab-2d7cd011db47
+

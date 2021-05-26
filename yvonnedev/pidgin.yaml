@@ -1,0 +1,122 @@
+---
+---
+# Source: pidgin/templates/service.yaml
+kind: Service
+apiVersion: v1
+metadata:
+  name: pidgin-service
+spec:
+  selector:
+    app: pidgin
+    release: pidgin
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+      name: http
+    - protocol: TCP
+      port: 443
+      targetPort: 443
+      name: https
+  type: ClusterIP
+---
+
+# Source: pidgin/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pidgin-deployment
+spec:
+  selector:
+    # Only select pods based on the 'app' label
+    matchLabels:
+      app: pidgin
+      release: pidgin
+      public: "yes"
+  revisionHistoryLimit: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: pidgin
+        release: pidgin
+        public: "yes"
+        #GEN3_DATE_LABEL
+        aadpodidbinding: azure-pod-identity-binding-selector
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - pidgin
+              topologyKey: "kubernetes.io/hostname"
+      automountServiceAccountToken: false
+      volumes:
+        - name: secrets-store-volume
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: pidgin-azure-kvname
+      containers:
+        - name: pidgin
+          image: "quay.io/cdis/pidgin:master"
+          env:
+          - name: GEN3_DEBUG_FLAG
+            value: "False"
+          livenessProbe:
+            httpGet:
+              path: /_status
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /_status
+              port: 80
+          ports:
+          - containerPort: 80
+          - containerPort: 443
+          volumeMounts:
+            - name: secrets-store-volume
+              mountPath: "/mnt/secrets-store"
+              readOnly: true
+          imagePullPolicy: Always
+          resources:
+            limits:
+              cpu: 0.8
+              memory: 512Mi
+---
+
+# Source: pidgin/templates/spc-pidgin.yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1alpha1
+kind: SecretProviderClass
+metadata:
+  name: pidgin-azure-kvname
+spec:
+  provider: "azure" # Only supporting Azure right now
+  parameters:
+    usePodIdentity: 'true'
+    keyvaultName: gen3-dev-ceok-kv
+    cloudName: 'AzurePublicCloud'
+    objects:  |
+      array:
+        - |
+          objectName: gen3-service-ca
+          objectType: cert
+          objectVersion: 
+    resourceGroup: rg-gen3-abrig-env 
+    subscriptionId: b59451c1-cd43-41b3-b3a4-74155d8f6cf6 
+    tenantId: 72f988bf-86f1-41af-91ab-2d7cd011db47
+
